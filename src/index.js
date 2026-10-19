@@ -66,6 +66,49 @@ class Cloudflare {
 	}
 }
 
+// A router with no address on a WAN (e.g. an unplugged failover port) still
+// calls in, substituting 0.0.0.0 or a private/CGNAT address for %i. Writing
+// that would take the hostname offline, so only accept public unicast IPs.
+function parseIPv4(ip) {
+	const parts = ip.split(".");
+	if (parts.length !== 4 || !parts.every(p => /^\d{1,3}$/.test(p) && Number(p) <= 255)) return null;
+	return parts.map(Number);
+}
+
+function isPublicIPv4(ip) {
+	const o = parseIPv4(ip);
+	if (!o) return false;
+	const [a, b] = o;
+	return !(
+		a === 0 || // 0.0.0.0/8 "this network"
+		a === 10 || // 10.0.0.0/8 private
+		(a === 100 && b >= 64 && b <= 127) || // 100.64.0.0/10 CGNAT
+		a === 127 || // 127.0.0.0/8 loopback
+		(a === 169 && b === 254) || // 169.254.0.0/16 link-local
+		(a === 172 && b >= 16 && b <= 31) || // 172.16.0.0/12 private
+		(a === 192 && b === 168) || // 192.168.0.0/16 private
+		a >= 224 // multicast, reserved, broadcast
+	);
+}
+
+function isPublicIPv6(ip) {
+	if (!/^[0-9a-f:]+$/i.test(ip) || !ip.includes(":")) return false;
+	const first = parseInt(ip.split(":")[0] || "0", 16);
+	return !(
+		/^[0:]+$/.test(ip) || // :: unspecified
+		/^[0:]+1$/.test(ip) || // ::1 loopback
+		(first & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+		(first & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+		(first & 0xff00) === 0xff00 // ff00::/8 multicast
+	);
+}
+
+function requirePublicIp(ip) {
+	if (!(ip.includes(".") ? isPublicIPv4(ip) : isPublicIPv6(ip))) {
+		throw new BadRequestException(`Refusing to set non-public IP address '${ip}'`);
+	}
+}
+
 function requireHttps(request) {
 	const { protocol } = new URL(request.url);
 	const forwardedProtocol = request.headers.get("x-forwarded-proto");
@@ -129,6 +172,9 @@ async function handleRequest(request) {
 	if (!hostnames || hostnames.length === 0 || !ips || ips.length === 0) {
 	        throw new BadRequestException("You must specify both hostname(s) and IP address(es)");
 	}
+
+	// Check every IP before touching any record, so a bad one can't leave a partial update
+	ips.forEach(ip => requirePublicIp(ip.trim()));
 
 	// Iterate over each IP and update DNS records for all hostnames
     	for (const ip of ips) {
